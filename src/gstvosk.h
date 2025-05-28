@@ -22,7 +22,9 @@
 
 #include <gio/gio.h>
 #include <gst/gst.h>
-
+#ifdef HAVE_RNNOISE
+#include <rnnoise.h>
+#endif
 #include "vosk-api.h"
 
 G_BEGIN_DECLS
@@ -40,7 +42,9 @@ G_BEGIN_DECLS
 
 typedef struct _GstVosk      GstVosk;
 typedef struct _GstVoskClass GstVoskClass;
-
+#ifdef HAVE_RNNOISE
+typedef struct DenoiseState DenoiseState;
+#endif
 struct _GstVosk
 {
   GstElement        element;
@@ -49,7 +53,9 @@ struct _GstVosk
   gchar            *model_path;
   gint              alternatives;
   gboolean          use_signals;
-
+#ifdef HAVE_RNNOISE
+  gboolean          enable_denoise;
+#endif
   gfloat            rate;
 
   GstClockTime      last_processed_time;
@@ -67,6 +73,16 @@ struct _GstVosk
   gchar            *prev_partial;
 
   GCancellable     *current_operation;
+#ifdef HAVE_RNNOISE
+  DenoiseState     *denoise_state;
+  gfloat           *denoise_input_buffer;
+  gsize             denoise_buffer_size;
+  gsize             denoise_buffer_pos;
+  gboolean          denoise_initialized;
+  GMutex            denoise_mutex;
+  gfloat           *denoise_output_buffer;
+  gsize             denoise_output_pos;
+#endif
 };
 
 struct _GstVoskClass
