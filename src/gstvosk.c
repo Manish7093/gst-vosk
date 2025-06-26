@@ -23,7 +23,10 @@
 #include <glib.h>
 #include <gio/gio.h>
 #include <gst/gst.h>
-
+#ifdef HAVE_RNNOISE
+#include <rnnoise.h>
+#include <math.h>
+#endif
 #include "gstvosk.h"
 #include "vosk-api.h"
 #include "../gst-vosk-config.h"
@@ -32,6 +35,11 @@ GST_DEBUG_CATEGORY_STATIC (gst_vosk_debug);
 #define GST_CAT_DEFAULT gst_vosk_debug
 
 #define DEFAULT_SPEECH_MODEL "/usr/share/vosk/model"
+#ifdef HAVE_RNNOISE
+#define DEFAULT_ENABLE_DENOISE TRUE
+#define RNNOISE_FRAME_SIZE 480  // RNNoise frame size (10ms at 48kHz)
+#define NOISE_ESTIMATION_FRAMES 50
+#endif
 #define DEFAULT_ALTERNATIVE_NUM 0
 
 #define _(STRING) gettext(STRING)
@@ -52,6 +60,9 @@ enum
   PROP_0,
   PROP_USE_SIGNALS,
   PROP_SPEECH_MODEL,
+#ifdef HAVE_RNNOISE
+  PROP_ENABLE_DENOISE,
+#endif
   PROP_ALTERNATIVES,
   PROP_CURRENT_FINAL_RESULTS,
   PROP_CURRENT_RESULTS,
@@ -168,6 +179,26 @@ static void
 gst_vosk_finalize (GObject *object)
 {
   GstVosk *vosk = GST_VOSK (object);
+#ifdef HAVE_RNNOISE
+  // Free RNNoise state
+  if (vosk->denoise_state) {
+    rnnoise_destroy(vosk->denoise_state);
+    vosk->denoise_state = NULL;
+  }
+
+  // Free denoise buffers
+  if (vosk->denoise_input_buffer) {
+    g_free(vosk->denoise_input_buffer);
+    vosk->denoise_input_buffer = NULL;
+  }
+
+  if (vosk->denoise_output_buffer) {
+        g_free(vosk->denoise_output_buffer);
+        vosk->denoise_output_buffer = NULL;
+    }
+
+  g_mutex_clear(&vosk->denoise_mutex);
+#endif
 
   if (vosk->model_path) {
     g_free (vosk->model_path);
@@ -200,7 +231,11 @@ gst_vosk_class_init (GstVoskClass * klass)
   g_object_class_install_property (gobject_class, PROP_SPEECH_MODEL,
       g_param_spec_string ("speech-model", _("Speech Model"), _("Location (path) of the speech model"),
           DEFAULT_SPEECH_MODEL, G_PARAM_READWRITE|GST_PARAM_MUTABLE_READY));
-
+#ifdef HAVE_RNNOISE
+  g_object_class_install_property (gobject_class, PROP_ENABLE_DENOISE,
+      g_param_spec_boolean ("enable-denoise", _("Enable Noise Reduction"), _("Enable RNNoise-based noise reduction"),
+          DEFAULT_ENABLE_DENOISE, G_PARAM_READWRITE|GST_PARAM_MUTABLE_READY));
+#endif
   g_object_class_install_property (gobject_class, PROP_ALTERNATIVES,
       g_param_spec_int ("alternatives", _("Alternative Number"), _("Number of alternative results returned"),
           0, 100, DEFAULT_ALTERNATIVE_NUM, G_PARAM_READWRITE));
@@ -262,7 +297,19 @@ gst_vosk_init (GstVosk * vosk)
   vosk->rate = 0.0;
   vosk->alternatives = DEFAULT_ALTERNATIVE_NUM;
   vosk->model_path = g_strdup(DEFAULT_SPEECH_MODEL);
+#ifdef HAVE_RNNOISE
+  vosk->enable_denoise = DEFAULT_ENABLE_DENOISE;
+  vosk->denoise_state = NULL;
+  vosk->denoise_input_buffer = NULL;
+  vosk->denoise_buffer_size = 0;
+  vosk->denoise_buffer_pos = 0;
+  vosk->denoise_initialized = FALSE;
 
+  g_mutex_init(&vosk->denoise_mutex);
+
+  vosk->denoise_output_buffer = NULL;
+  vosk->denoise_output_pos = 0;
+#endif
   vosk->thread_pool=g_thread_pool_new((GFunc) gst_vosk_load_model_async,
                                       vosk,
                                       1,
@@ -282,6 +329,18 @@ gst_vosk_reset (GstVosk *vosk)
     g_free (vosk->prev_partial);
     vosk->prev_partial = NULL;
   }
+#ifdef HAVE_RNNOISE
+  // Reset denoise state
+  g_mutex_lock(&vosk->denoise_mutex);
+  if (vosk->denoise_input_buffer) {
+    vosk->denoise_buffer_pos = 0;
+    memset(vosk->denoise_input_buffer, 0, vosk->denoise_buffer_size * sizeof(gfloat));
+  }
+  vosk->denoise_initialized = FALSE;
+  g_mutex_unlock(&vosk->denoise_mutex);
+
+  GST_DEBUG_OBJECT(vosk, "Vosk reset completed");
+#endif
 
   vosk->last_processed_time=GST_CLOCK_TIME_NONE;
   vosk->rate=0.0;
@@ -326,6 +385,156 @@ gst_vosk_get_rate(GstVosk *vosk)
   return rate;
 }
 
+#ifdef HAVE_RNNOISE
+static gboolean
+gst_vosk_init_denoise(GstVosk *vosk)
+{
+  gint rate;
+
+  if (!vosk->enable_denoise || vosk->denoise_initialized)
+    return TRUE;
+
+  rate = gst_vosk_get_rate(vosk);
+  if (rate <= 0) {
+    GST_DEBUG_OBJECT(vosk, "Sample rate not available, deferring denoise initialization");
+    return FALSE;
+  }
+
+  g_mutex_lock(&vosk->denoise_mutex);
+
+  // Clean up existing state
+  if (vosk->denoise_state) {
+    rnnoise_destroy(vosk->denoise_state);
+    vosk->denoise_state = NULL;
+  }
+
+  if (vosk->denoise_input_buffer) {
+    g_free(vosk->denoise_input_buffer);
+    vosk->denoise_input_buffer = NULL;
+  }
+
+  // Create RNNoise state
+  vosk->denoise_state = rnnoise_create(NULL);
+  if (!vosk->denoise_state) {
+    GST_WARNING_OBJECT(vosk, "Failed to create RNNoise state");
+    g_mutex_unlock(&vosk->denoise_mutex);
+    return FALSE;
+  }
+
+  // Allocate input buffer for accumulating samples
+  vosk->denoise_buffer_size = RNNOISE_FRAME_SIZE * 2; // Buffer 2 frames
+  vosk->denoise_input_buffer = g_malloc0(vosk->denoise_buffer_size * sizeof(gfloat));
+  vosk->denoise_buffer_pos = 0;
+
+  // Allocate output buffer for storing processed frames
+  vosk->denoise_output_buffer = g_malloc0(vosk->denoise_buffer_size * sizeof(gfloat));
+  vosk->denoise_output_pos = 0;
+  vosk->denoise_initialized = TRUE;
+
+  g_mutex_unlock(&vosk->denoise_mutex);
+
+  GST_INFO_OBJECT(vosk, "RNNoise initialized successfully (input rate: %d Hz)", rate);
+  return TRUE;
+}
+
+static void
+gst_vosk_process_denoise_frame(GstVosk *vosk, gfloat *frame_data)
+{
+  if (!vosk->denoise_state || !vosk->denoise_initialized)
+    return;
+
+  rnnoise_process_frame(vosk->denoise_state, frame_data, frame_data);
+}
+
+static void
+gst_vosk_convert_s16_to_float(gint16 *input, gfloat *output, gsize samples)
+{
+  for (gsize i = 0; i < samples; i++) {
+    output[i] = (gfloat)input[i] ;
+  }
+}
+
+static void
+gst_vosk_convert_float_to_s16(gfloat *input, gint16 *output, gsize samples)
+{
+  for (gsize i = 0; i < samples; i++) {
+    gfloat sample = input[i] ;
+    output[i] = (gint16)CLAMP(sample, -32768.0f, 32767.0f);
+  }
+}
+
+static void
+gst_vosk_apply_denoise(GstVosk *vosk, GstMapInfo *info)
+{
+    if (!vosk->enable_denoise || !vosk->denoise_initialized) {
+        return;
+    }
+
+    g_mutex_lock(&vosk->denoise_mutex);
+
+    if (vosk->rate != 48000) {
+        g_mutex_unlock(&vosk->denoise_mutex);
+        return;
+    }
+
+    gint16 *s16_buffer = (gint16 *)info->data;
+    gsize s16_buffer_samples = info->size / sizeof(gint16);
+
+    gsize samples_read = 0;
+    while (samples_read < s16_buffer_samples) {
+        gsize to_copy = MIN(RNNOISE_FRAME_SIZE - vosk->denoise_buffer_pos, 
+                            s16_buffer_samples - samples_read);
+
+        gst_vosk_convert_s16_to_float(s16_buffer + samples_read,
+                                      vosk->denoise_input_buffer + vosk->denoise_buffer_pos,
+                                      to_copy);
+        samples_read += to_copy;
+        vosk->denoise_buffer_pos += to_copy;
+
+        // If we have a full frame, denoise it and move it to the output buffer
+        if (vosk->denoise_buffer_pos == RNNOISE_FRAME_SIZE) {
+            gst_vosk_process_denoise_frame(vosk, vosk->denoise_input_buffer);
+
+            if ((vosk->denoise_output_pos + RNNOISE_FRAME_SIZE) <= vosk->denoise_buffer_size) {
+                // Append the clean frame to our "ready" output buffer
+                memcpy(vosk->denoise_output_buffer + vosk->denoise_output_pos,
+                       vosk->denoise_input_buffer,
+                       RNNOISE_FRAME_SIZE * sizeof(gfloat));
+                vosk->denoise_output_pos += RNNOISE_FRAME_SIZE;
+            } else {
+                GST_WARNING_OBJECT(vosk, "Denoise output buffer is full. Dropping a processed frame to prevent memory corruption.");
+            }
+
+            vosk->denoise_buffer_pos = 0; // Reset input buffer
+        }
+    }
+
+    gsize samples_to_write = MIN(vosk->denoise_output_pos, s16_buffer_samples);
+
+    if (samples_to_write > 0) {
+        gst_vosk_convert_float_to_s16(vosk->denoise_output_buffer,
+                                      s16_buffer,
+                                      samples_to_write);
+
+        // Remove the data we just used from the output buffer by shifting the remainder
+        vosk->denoise_output_pos -= samples_to_write;
+        if (vosk->denoise_output_pos > 0) {
+            memmove(vosk->denoise_output_buffer,
+                    vosk->denoise_output_buffer + samples_to_write,
+                    vosk->denoise_output_pos * sizeof(gfloat));
+        }
+    }
+
+    // If we don't have enough clean audio to fill the whole buffer, fill the rest with silence.
+    if (samples_to_write < s16_buffer_samples) {
+        gsize silence_samples = s16_buffer_samples - samples_to_write;
+        memset(s16_buffer + samples_to_write, 0, silence_samples * sizeof(gint16));
+    }
+
+    g_mutex_unlock(&vosk->denoise_mutex);
+}
+#endif
+
 static gboolean
 gst_vosk_recognizer_new (GstVosk *vosk, VoskModel *model)
 {
@@ -341,7 +550,12 @@ gst_vosk_recognizer_new (GstVosk *vosk, VoskModel *model)
     GST_INFO_OBJECT (vosk, "no model provided.");
     return FALSE;
   }
-
+#ifdef HAVE_RNNOISE
+  // Setup denoise after we have the sample rate
+  if (vosk->enable_denoise) {
+    gst_vosk_init_denoise(vosk);
+  }
+#endif
   GST_INFO_OBJECT (vosk, "creating recognizer (rate = %f).", vosk->rate);
   vosk->recognizer = vosk_recognizer_new (model, vosk->rate);
   vosk_recognizer_set_max_alternatives (vosk->recognizer, vosk->alternatives);
@@ -584,7 +798,13 @@ gst_vosk_set_property (GObject * object, guint prop_id,
     case PROP_SPEECH_MODEL:
       gst_vosk_set_model_path(vosk, g_value_get_string (value));
       break;
-
+#ifdef HAVE_RNNOISE
+    case PROP_ENABLE_DENOISE:
+      vosk->enable_denoise = g_value_get_boolean(value);
+      vosk->denoise_initialized = FALSE; // Force re-initialization
+      GST_INFO_OBJECT(vosk, "Denoise %s", vosk->enable_denoise ? "enabled" : "disabled");
+      break;
+#endif
     case PROP_ALTERNATIVES:
       if (vosk->alternatives == g_value_get_int (value))
         return;
@@ -683,7 +903,11 @@ gst_vosk_get_property (GObject *object,
     case PROP_SPEECH_MODEL:
       g_value_set_string (prop_value, vosk->model_path);
       break;
-
+#ifdef HAVE_RNNOISE
+    case PROP_ENABLE_DENOISE:
+      g_value_set_boolean(prop_value, vosk->enable_denoise);
+      break;
+#endif
     case PROP_ALTERNATIVES:
       g_value_set_int(prop_value, vosk->alternatives);
       break;
@@ -834,6 +1058,7 @@ gst_vosk_partial_result (GstVosk *vosk)
   gst_vosk_message_new (vosk, json_txt);
 }
 
+
 static void
 gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
 {
@@ -842,9 +1067,27 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
   GstMapInfo info;
   int result;
 
+#ifndef HAVE_RNNOISE
   gst_buffer_map(buf, &info, GST_MAP_READ);
   if (G_UNLIKELY(info.size == 0))
     return;
+#endif
+
+#ifdef HAVE_RNNOISE
+  // Map buffer for read/write to allow in-place denoising
+  if (!gst_buffer_map(buf, &info, GST_MAP_READWRITE)) {
+    GST_WARNING_OBJECT(vosk, "Failed to map buffer");
+    return;
+  }
+
+  if (G_UNLIKELY(info.size == 0)) {
+    gst_buffer_unmap(buf, &info);
+    return;
+  }
+
+  // Apply denoising if enabled
+  gst_vosk_apply_denoise(vosk, &info);
+#endif
 
   result = vosk_recognizer_accept_waveform (vosk->recognizer,
                                             (gchar*) info.data,
@@ -901,6 +1144,9 @@ gst_vosk_handle_buffer(GstVosk *vosk, GstBuffer *buf)
     gst_vosk_partial_result(vosk);
     vosk->last_partial=GST_BUFFER_PTS(buf);
   }
+#ifdef HAVE_RNNOISE
+   gst_buffer_unmap(buf, &info);
+#endif
 }
 
 static GstFlowReturn
